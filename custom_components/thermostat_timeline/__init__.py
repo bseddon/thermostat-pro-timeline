@@ -810,6 +810,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if want_main:
                     if "defaultTemp" in row:
                         new_row["defaultTemp"] = row["defaultTemp"]
+                    if "defaultMode" in row:
+                        new_row["defaultMode"] = row["defaultMode"]
                     if "blocks" in row:
                         new_row["blocks"] = row["blocks"]
                 if want_profiles:
@@ -1180,6 +1182,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if want_main:
                     if "defaultTemp" in brow:
                         row["defaultTemp"] = brow["defaultTemp"]
+                    row["defaultMode"] = brow.get("defaultMode")
                     if "blocks" in brow:
                         row["blocks"] = brow["blocks"]
                 if want_profiles:
@@ -1257,6 +1260,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return
         cur = dict(hass.data[DOMAIN]["schedules"].get(eid, {}))
         if "defaultTemp" in d: cur["defaultTemp"] = d["defaultTemp"]
+        if "defaultMode" in d: cur["defaultMode"] = d["defaultMode"]
         if "blocks" in d and isinstance(d["blocks"], list): cur["blocks"] = d["blocks"]
         hass.data[DOMAIN]["schedules"][eid] = cur
         hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
@@ -1622,7 +1626,12 @@ class AutoApplyManager:
                 wk = row.get("weekly")
                 if wk and isinstance(wk, dict):
                     days = wk.get("days") or {}
-                    arr = days.get(self._today_key())
+                    mode = wk.get("mode") or settings.get("weekdays_mode") or "weekday_weekend"
+                    mode_days = ((row.get("weekly_modes") or {}).get(mode) or {}).get("days") or {}
+                    day_key = self._today_key()
+                    arr = mode_days.get(day_key)
+                    if not isinstance(arr, list):
+                        arr = days.get(day_key)
                     if isinstance(arr, list):
                         return arr
         except Exception:
@@ -1792,6 +1801,45 @@ class AutoApplyManager:
             pass
         return want
 
+    def _desired_action_for(self, eid: str, schedules: dict, settings: dict, now_min: int) -> Optional[dict]:
+        primary = eid
+        if eid not in schedules:
+            for candidate, members in (settings.get("merges") or {}).items():
+                if eid in (members or []):
+                    primary = candidate
+                    break
+        row = schedules.get(primary)
+        if not isinstance(row, dict):
+            return None
+        hit = None
+        for block in self._effective_blocks_today(row, settings):
+            try:
+                if int(block.get("startMin", -1)) <= now_min < int(block.get("endMin", -1)):
+                    hit = block
+                    break
+            except (TypeError, ValueError):
+                continue
+        mode = hit.get("hvacMode") if hit is not None else row.get("defaultMode")
+        if not eid.startswith("climate.") or mode not in ("heat", "off"):
+            mode = None
+        if mode == "off":
+            return {"hvacMode": "off", "temperature": None}
+        try:
+            temperature = self._desired_for(eid, schedules, settings, now_min)
+            if temperature is None or not float("-inf") < float(temperature) < float("inf"):
+                return None
+        except (TypeError, ValueError):
+            return None
+        return {"hvacMode": mode, "temperature": temperature}
+
+    async def _apply_mode_action(self, eid: str, action: dict, now_min: int, reconcile: bool = False) -> None:
+        last = self._last_applied.get(eid) or {}
+        if not reconcile and last.get("hvacMode") == action["hvacMode"] and last.get("temp") == action["temperature"]:
+            return
+        ok = await self._apply_setpoint(eid, action["temperature"] or 0, requested_mode=action["hvacMode"])
+        if ok:
+            self._last_applied[eid] = {"min": now_min, "temp": action["temperature"], "hvacMode": action["hvacMode"]}
+
     async def _maybe_apply_now(self, force: bool = False, boundary_only: bool = False, reconcile: bool = False):
         if not self._auto_apply_enabled():
             return
@@ -1834,7 +1882,13 @@ class AutoApplyManager:
                 except Exception:
                     # if in doubt, skip to avoid overriding manual changes unnecessarily
                     continue
-            desired = self._desired_for(eid, schedules, settings, now_min)
+            action = self._desired_action_for(eid, schedules, settings, now_min)
+            if action is None:
+                continue
+            if action["hvacMode"]:
+                await self._apply_mode_action(eid, action, now_min, reconcile)
+                continue
+            desired = action["temperature"]
             if desired is None:
                 continue
             # Only apply when desired setpoint changes for this entity.
@@ -1850,7 +1904,7 @@ class AutoApplyManager:
                 last_temp = float(lt) if isinstance(lt, (int, float, str)) else None
             except Exception:
                 last_temp = None
-            schedule_unchanged = (last_temp is not None) and abs(last_temp - float(desired)) < 0.05
+            schedule_unchanged = last.get("hvacMode") is None and (last_temp is not None) and abs(last_temp - float(desired)) < 0.05
             if (not reconcile) and schedule_unchanged:
                 continue
             # Manual override guard: only relevant when OUR desired value for this
@@ -1989,7 +2043,13 @@ class AutoApplyManager:
 
             schedules, settings = self._get_data()
             now_min = self._now_min()
-            desired = self._desired_for(eid, schedules, settings, now_min)
+            action = self._desired_action_for(eid, schedules, settings, now_min)
+            if action is None:
+                return
+            if action["hvacMode"]:
+                await self._apply_mode_action(eid, action, now_min, reconcile)
+                return
+            desired = action["temperature"]
             if desired is None:
                 return
 
@@ -2000,7 +2060,7 @@ class AutoApplyManager:
                     last_temp = float(lt) if isinstance(lt, (int, float, str)) else None
                 except Exception:
                     last_temp = None
-                if (last_temp is not None) and abs(last_temp - float(desired)) < 0.05:
+                if last.get("hvacMode") is None and (last_temp is not None) and abs(last_temp - float(desired)) < 0.05:
                     return
 
             ok = await self._apply_setpoint(eid, float(desired))
@@ -2847,7 +2907,7 @@ class AutoApplyManager:
             pass
         return False
 
-    async def _apply_setpoint(self, eid: str, desired: float) -> bool:
+    async def _apply_setpoint(self, eid: str, desired: float, requested_mode: Optional[str] = None) -> bool:
         """Apply desired setpoint robustly across HVAC modes.
 
         Strategy:
@@ -3070,6 +3130,27 @@ class AutoApplyManager:
                 except Exception:
                     pass
                 return val_c
+
+            if requested_mode in ("heat", "off"):
+                if st.state in ("unknown", "unavailable") or requested_mode not in hvac_modes:
+                    return False
+                if requested_mode == "off":
+                    if hvac_mode != "off":
+                        await self.hass.services.async_call(
+                            "climate", "set_hvac_mode", {"entity_id": eid, "hvac_mode": "off"}, blocking=True
+                        )
+                    return True
+                if not float("-inf") < desired_c < float("inf"):
+                    return False
+                await self.hass.services.async_call(
+                    "climate", "set_temperature",
+                    {"entity_id": eid, "temperature": _to_ha_from_c(_clamp_c(desired_c))}, blocking=True
+                )
+                if hvac_mode != "heat":
+                    await self.hass.services.async_call(
+                        "climate", "set_hvac_mode", {"entity_id": eid, "hvac_mode": "heat"}, blocking=True
+                    )
+                return True
 
             # If preset has a manual/hold and not active, switch to it
             try:

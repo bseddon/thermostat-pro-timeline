@@ -54,6 +54,27 @@ Thermostat Pro Timeline is a Home Assistant solution composed of:
 - 🕹️ **Background control**: Thermostats update even when the card is closed, as long as storage is enabled.
 - 👨‍👩‍👧‍👦 **Multi-user safe**: Shared storage and sync for all dashboards and users.
 
+## Scheduled Heating Modes
+
+Climate periods can use **Heat**, **Off**, or **Temperature only**. Heat sets the
+target before selecting `heat`; Off selects `off` without sending a temperature
+or preset command. The room's **Gaps** control selects the same behavior outside
+its periods, with a target available for Heat gaps. Room update switches, pauses,
+and open-window suspension still take precedence.
+
+Stored blocks optionally contain `hvacMode: "heat"` or `hvacMode: "off"`; room
+rows optionally contain `defaultMode` with the same values. Absent or null modes
+preserve the existing temperature-only behavior and turn-on settings. Editing a
+legacy block does not automatically add Heat. New climate blocks start in Heat;
+`input_number` schedules remain temperature-only. Periods include their start
+and exclude their end.
+
+Background execution requires the matching integration with shared storage and
+auto-apply enabled. The integration reconciles the current period after a
+restart; the frontend alone is not a dependable background scheduler. Deploying
+these changes to a disconnected simulation does not install that backend or
+change real thermostat schedules.
+
 ## 🌍 Localization
 
 | Language       | Supported |

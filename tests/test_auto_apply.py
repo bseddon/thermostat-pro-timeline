@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import logging
+import time
 import unittest
 from typing import Optional, Any
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ tree = ast.parse(source.read_text(encoding="utf-8"))
 manager = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AutoApplyManager")
 namespace = dict(HomeAssistant=object, Optional=Optional, Any=Any, _norm_instance_id=lambda x:x, DOMAIN="thermostat_timeline",
     asyncio=asyncio, _LOGGER=logging.getLogger(__name__),
+    time=time,
     UnitOfTemperature=SimpleNamespace(FAHRENHEIT="F"),
     dt_util=SimpleNamespace(utcnow=lambda:datetime.now(timezone.utc)))
 exec(compile(ast.Module(body=[manager], type_ignores=[]), str(source), "exec"), namespace)
@@ -53,6 +55,115 @@ class AutoApplyTests(unittest.IsolatedAsyncioTestCase):
         mgr = self.make({},state="heat",attrs={"hvac_modes":["heat"],"preset_modes":["boost","manual"],"preset_mode":"boost"})
         self.assertTrue(await mgr._apply_setpoint("climate.room",20))
         self.assertEqual(self.call.await_args_list[0].args[2]["preset_mode"],"manual")
+
+    async def test_explicit_modes_have_safe_command_order(self):
+        mgr = self.make({}, state="heat")
+        self.assertTrue(await mgr._apply_setpoint("climate.room", 0, requested_mode="off"))
+        self.assertEqual([call.args[1] for call in self.call.await_args_list], ["set_hvac_mode"])
+        self.assertEqual(self.call.await_args.args[2]["hvac_mode"], "off")
+        mgr = self.make({"turn_on":{"climate.room":{"enabled":False}}})
+        self.assertTrue(await mgr._apply_setpoint("climate.room", 21, requested_mode="heat"))
+        self.assertEqual([call.args[1] for call in self.call.await_args_list], ["set_temperature", "set_hvac_mode"])
+        self.assertEqual(self.call.await_args_list[0].args[2]["temperature"], 21)
+
+    async def test_mode_boundaries_gap_and_restart_reconciliation(self):
+        mgr = self.make({"auto_apply_enabled":True}, state="heat")
+        row = {"defaultTemp":17, "defaultMode":"off", "blocks":[
+            {"startMin":60,"endMin":120,"temp":21,"hvacMode":"heat"},
+            {"startMin":120,"endMin":180,"hvacMode":"off"}]}
+        schedules = mgr.hass.data["thermostat_timeline"]["schedules"]
+        schedules["climate.room"] = row
+        settings = mgr.hass.data["thermostat_timeline"]["settings"]
+        self.assertEqual(mgr._desired_action_for("climate.room",schedules,settings,60),{"hvacMode":"heat","temperature":21})
+        self.assertEqual(mgr._desired_action_for("climate.room",schedules,settings,120),{"hvacMode":"off","temperature":None})
+        self.assertEqual(mgr._desired_action_for("climate.room",schedules,settings,180),{"hvacMode":"off","temperature":None})
+        mgr._now_min = lambda:120
+        await mgr._maybe_apply_now(boundary_only=True)
+        self.assertEqual([call.args[1] for call in self.call.await_args_list],["set_hvac_mode"])
+        self.call.reset_mock()
+        await mgr._maybe_apply_now()
+        self.call.assert_not_awaited()
+        restarted = self.make({"auto_apply_enabled":True},state="heat")
+        restarted.hass.data["thermostat_timeline"]["schedules"]["climate.room"] = row
+        restarted._now_min = lambda:150
+        await restarted._maybe_apply_now(reconcile=True)
+        self.assertEqual(self.call.await_args.args[2]["hvac_mode"],"off")
+
+    async def test_one_day_holiday_heat_expires_without_repeating(self):
+        mgr = self.make({"weekdays_enabled":True,"holidays_enabled":True,
+            "holidays_source":"manual","holidays_dates":["2026-11-15"]})
+        mgr._today_key = lambda:"sun"
+        mgr._today_iso = lambda:"2026-11-15"
+        row = {"defaultTemp":20.5,"defaultMode":"off","blocks":[],
+            "weekly":{"mode":"all_7","days":{"sun":[]}},
+            "holiday":{"blocks":[{"startMin":375,"endMin":1140,"temp":20.5,"hvacMode":"heat"}]}}
+        schedules = {"climate.room":row}
+        settings = mgr.hass.data["thermostat_timeline"]["settings"]
+        for minute, mode in ((374,"off"),(375,"heat"),(1139,"heat"),(1140,"off")):
+            self.assertEqual(mgr._desired_action_for("climate.room",schedules,settings,minute)["hvacMode"],mode)
+        mgr._today_iso = lambda:"2026-11-22"
+        self.assertEqual(mgr._desired_action_for("climate.room",schedules,settings,375)["hvacMode"],"off")
+        ordinary = {"defaultMode":"off","weekly":{"mode":"all_7","days":{"sun":[
+            {"startMin":1020,"endMin":1140,"temp":26.5,"hvacMode":"heat"}]}}}
+        mgr._today_iso = lambda:"2026-11-15"
+        self.assertEqual(mgr._effective_blocks_today(ordinary,settings),ordinary["weekly"]["days"]["sun"])
+
+    async def test_explicit_mode_respects_disabled_room(self):
+        mgr = self.make({"apply_enabled":{"climate.room":False}},state="heat")
+        self.assertFalse(await mgr._apply_setpoint("climate.room",0,requested_mode="off"))
+        self.call.assert_not_awaited()
+
+    async def test_mode_only_boundary_and_merged_room_pause(self):
+        mgr = self.make({"auto_apply_enabled":True,"merges":{"climate.room":["climate.secondary"]}},state="off")
+        row = {"defaultTemp":17,"blocks":[{"startMin":60,"endMin":120,"temp":21,"hvacMode":"heat"}]}
+        schedules = mgr.hass.data["thermostat_timeline"]["schedules"]
+        schedules["climate.room"] = row
+        settings = mgr.hass.data["thermostat_timeline"]["settings"]
+        self.assertEqual(mgr._desired_action_for("climate.secondary",schedules,settings,60),{"hvacMode":"heat","temperature":21})
+        mgr._now_min = lambda:60
+        mgr.hass.states.get("climate.room").attributes["temperature"] = 21
+        await mgr._maybe_apply_now(boundary_only=True)
+        self.assertEqual(self.call.await_args.args[2]["hvac_mode"],"heat")
+        self.call.reset_mock()
+        settings["room_pause"] = {"climate.room":{"indef":True}}
+        self.assertFalse(await mgr._apply_setpoint("climate.secondary",0,requested_mode="off"))
+        self.call.assert_not_awaited()
+
+    async def test_failed_heat_command_never_enables_or_caches(self):
+        mgr = self.make({"auto_apply_enabled":True},state="off")
+        mgr.hass.data["thermostat_timeline"]["schedules"]["climate.room"] = {"blocks":[{"startMin":0,"endMin":1440,"temp":21,"hvacMode":"heat"}]}
+        mgr._now_min = lambda:60
+        self.call.side_effect = RuntimeError("simulated service failure")
+        await mgr._maybe_apply_now()
+        self.assertEqual([call.args[1] for call in self.call.await_args_list],["set_temperature"])
+        self.assertNotIn("climate.room",mgr._last_applied)
+        self.call.side_effect = None
+        await mgr._maybe_apply_now()
+        self.assertEqual(mgr._last_applied["climate.room"]["hvacMode"],"heat")
+
+    async def test_entity_patch_persists_and_clears_default_mode(self):
+        mgr = self.make({})
+        mgr.hass.data["thermostat_timeline"]["version"] = 1
+        patch_function = next(node for node in ast.walk(tree) if isinstance(node,ast.AsyncFunctionDef) and node.name == "patch_entity")
+        scope = dict(hass=mgr.hass,ServiceCall=object,DOMAIN="thermostat_timeline",_LOGGER=namespace["_LOGGER"],_save_and_broadcast=AsyncMock())
+        exec(compile(ast.Module(body=[patch_function],type_ignores=[]),str(source),"exec"),scope)
+        for mode in ("off",None):
+            await scope["patch_entity"](SimpleNamespace(data={"entity_id":"climate.room","data":{"defaultMode":mode}}))
+            self.assertEqual(mgr.hass.data["thermostat_timeline"]["schedules"]["climate.room"]["defaultMode"],mode)
+
+    async def test_effective_weekday_prefers_copied_mode_and_keeps_legacy_fallback(self):
+        mgr = self.make({"weekdays_enabled":True})
+        mgr._today_key = lambda:"sun"
+        settings = mgr.hass.data["thermostat_timeline"]["settings"]
+        row = {"defaultTemp":18.5,"defaultMode":"heat","blocks":[],
+            "weekly":{"mode":"all_7","days":{"sun":[{"startMin":60,"endMin":120,"temp":21}]}},
+            "weekly_modes":{"all_7":{"days":{"sun":[{"startMin":60,"endMin":120,"hvacMode":"off"}]}}}}
+        schedules = {"climate.room":row}
+        self.assertEqual(mgr._desired_action_for("climate.room",schedules,settings,90),{"hvacMode":"off","temperature":None})
+        row["weekly_modes"]["all_7"]["days"]["sun"] = []
+        self.assertEqual(mgr._desired_action_for("climate.room",schedules,settings,90),{"hvacMode":"heat","temperature":18.5})
+        del row["weekly_modes"]["all_7"]["days"]["sun"]
+        self.assertEqual(mgr._desired_action_for("climate.room",schedules,settings,90),{"hvacMode":None,"temperature":21})
 
 
 class ManualOverrideTests(unittest.IsolatedAsyncioTestCase):

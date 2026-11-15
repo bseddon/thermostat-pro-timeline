@@ -119,3 +119,113 @@ test('shared storage card initialization does not send climate temperature comma
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(calls.filter(args=>args[0]==='climate').length,0);
 });
+
+test('explicit Heat/Off periods preserve legacy targets and respect half-open boundaries',()=>{
+  const c=card();
+  c._schedules['climate.room']={defaultTemp:17,blocks:[
+    {id:'legacy',startMin:60,endMin:120,temp:21},
+    {id:'off',startMin:120,endMin:180,hvacMode:'off'},
+    {id:'heat',startMin:180,endMin:240,temp:20,hvacMode:'heat'},
+  ]};
+  assert.equal(c._desiredTempFor('climate.room',90),21);
+  assert.equal(JSON.stringify(c._desiredActionFor('climate.room',90)),JSON.stringify({hvacMode:null,temperature:21}));
+  assert.equal(JSON.stringify(c._desiredActionFor('climate.room',120)),JSON.stringify({hvacMode:'off',temperature:null}));
+  assert.equal(JSON.stringify(c._desiredActionFor('climate.room',180)),JSON.stringify({hvacMode:'heat',temperature:20}));
+  c._schedules['climate.room'].defaultMode='off';
+  assert.equal(JSON.stringify(c._desiredActionFor('climate.room',240)),JSON.stringify({hvacMode:'off',temperature:null}));
+});
+
+test('block editor opens with the stored mode and Off labels contain no temperature',()=>{
+  const c=card();
+  c._schedules['climate.room']={defaultTemp:17,blocks:[{id:'off',startMin:60,endMin:120,temp:21}]};
+  c._editing={entity:'climate.room',blockId:'off',weeklyDay:'sat'};
+  c._weeklyDraft={days:{sat:[{id:'off',startMin:60,endMin:120,hvacMode:'off'}]}};
+  c.shadowRoot={querySelector:()=>null};
+  let mode,opened=0;
+  c._setEditorMode=value=>mode=value;
+  c._openBlockOverlay({classList:{add:()=>opened++}});
+  assert.equal(mode,'off');
+  assert.equal(opened,1);
+  assert.equal(c._blockLabel({hvacMode:'off'}),'Off');
+});
+
+test('weekday editor saves the selected Off mode without changing its time interval',async()=>{
+  const c=card();
+  c._schedules['climate.room']={defaultTemp:17,blocks:[]};
+  c._editing={entity:'climate.room',blockId:'block',weeklyDay:'sat'};
+  c._weeklyDraft={days:{sat:[{id:'block',startMin:540,endMin:1080,temp:21}]}};
+  const inputs={'.ed-mode':{dataset:{mode:'off'}},'.ed-temp':{value:'21'},'.ed-from':{value:'09:00'},'.ed-to':{value:'18:00'}};
+  c.shadowRoot={querySelector:selector=>inputs[selector]||null};
+  c._closeEditor=()=>{};c._renderWeeklyModal=()=>{};c._desiredNowSnapshot=()=>({});
+  await c._saveEditor();
+  const block=c._weeklyDraft.days.sat[0];
+  assert.equal(block.hvacMode,'off');
+  assert.equal(block.startMin,540);
+  assert.equal(block.endMin,1080);
+});
+
+test('explicit Off sends no setpoint; explicit Heat sets target before enabling',async()=>{
+  const c=card(),calls=[];
+  c._hass={states:{'climate.room':{state:'heat',attributes:{hvac_modes:['off','heat']}}},
+    callService:async(domain,service,data)=>calls.push({service,data})};
+  assert.equal(await c._applySetpointForEntity('climate.room',0,'off'),true);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)),[{service:'set_hvac_mode',data:{entity_id:'climate.room',hvac_mode:'off'}}]);
+  calls.length=0;c._hass.states['climate.room'].state='off';
+  assert.equal(await c._applySetpointForEntity('climate.room',21,'heat'),true);
+  assert.deepEqual(calls.map(call=>call.service),['set_temperature','set_hvac_mode']);
+  assert.equal(calls[0].data.temperature,21);
+  c._config.apply_enabled={'climate.room':false};calls.length=0;
+  await c._applySetpointForEntity('climate.room',0,'off');
+  assert.equal(calls.length,0);
+});
+
+test('weekday midnight splits retain Off and legacy editing clears the mode',async()=>{
+  for (const mode of ['off','']) {
+    const c=card();
+    c._schedules['climate.room']={defaultTemp:17,blocks:[]};
+    c._editing={entity:'climate.room',blockId:'block',weeklyDay:'sat'};
+    c._weeklyDraft={days:{sat:[{id:'block',startMin:540,endMin:1080,temp:21,hvacMode:'heat'}]}};
+    const inputs={'.ed-mode':{dataset:{mode}},'.ed-temp':{value:'21'},'.ed-from':{value:'23:00'},'.ed-to':{value:'02:00'}};
+    c.shadowRoot={querySelector:selector=>inputs[selector]||null};
+    c._closeEditor=()=>{};c._renderWeeklyModal=()=>{};c._desiredNowSnapshot=()=>({});
+    await c._saveEditor();
+    const blocks=c._weeklyDraft.days.sat;
+    assert.equal(blocks.length,2);
+    assert.deepEqual(Array.from(blocks,block=>[block.startMin,block.endMin,block.hvacMode]),[[0,120,mode||null],[1380,1440,mode||null]]);
+  }
+});
+
+test('mode-only boundaries apply and failed commands are retried without cached success',async()=>{
+  const c=card();let minute=60;
+  c._config.auto_apply=true;c._config.storage_enabled=false;c._lastApplied={};
+  c._getNowMin=()=>minute;c._isPaused=()=>false;c._allTargetEntities=()=>['climate.room'];
+  c._hass={states:{'climate.room':{state:'off',attributes:{temperature:21,hvac_modes:['heat','off']}}},callService:async()=>{}};
+  c._schedules['climate.room']={defaultTemp:17,blocks:[{startMin:60,endMin:120,temp:21,hvacMode:'heat'},{startMin:120,endMin:180,temp:21,hvacMode:'off'}]};
+  const calls=[];c._applySetpointForEntity=async(eid,temp,mode)=>{calls.push(mode);return true;};
+  await c._applyCurrentSetpoints();minute=120;await c._applyCurrentSetpoints();
+  assert.deepEqual(calls,['heat','off']);
+  c._lastApplied={};c._applySetpointForEntity=async()=>false;
+  await c._applyCurrentSetpoints();assert.equal(c._lastApplied['climate.room'],undefined);
+  let retry=0;c._applySetpointForEntity=async()=>{retry++;return true;};
+  await c._applyCurrentSetpoints();assert.equal(retry,1);
+});
+
+test('failed Heat target never enables heat and input_number modes stay numeric',async()=>{
+  const c=card(),calls=[];
+  c._hass={states:{'climate.room':{state:'off',attributes:{hvac_modes:['off','heat']}}},callService:async(domain,service)=>{calls.push(service);throw Error('failed');}};
+  assert.equal(await c._applySetpointForEntity('climate.room',21,'heat'),false);
+  assert.deepEqual(calls,['set_temperature']);
+  c._schedules['input_number.room']={defaultTemp:17,defaultMode:'off',blocks:[{startMin:60,endMin:120,temp:21,hvacMode:'off'}]};
+  assert.equal(JSON.stringify(c._desiredActionFor('input_number.room',60)),JSON.stringify({hvacMode:null,temperature:21}));
+});
+
+test('effective weekday actions prefer copied mode data and retain legacy fallback',()=>{
+  const c=card();c._config.weekdays_enabled=true;c._todayKey=()=>'sun';
+  const row={defaultTemp:18.5,defaultMode:'heat',blocks:[],weekly:{mode:'all_7',days:{sun:[{startMin:60,endMin:120,temp:21}]}},weekly_modes:{all_7:{days:{sun:[{startMin:60,endMin:120,hvacMode:'off'}]}}}};
+  c._schedules['climate.room']=row;
+  assert.equal(JSON.stringify(c._desiredActionFor('climate.room',90)),JSON.stringify({hvacMode:'off',temperature:null}));
+  row.weekly_modes.all_7.days.sun=[];
+  assert.equal(JSON.stringify(c._desiredActionFor('climate.room',90)),JSON.stringify({hvacMode:'heat',temperature:18.5}));
+  delete row.weekly_modes.all_7.days.sun;
+  assert.equal(JSON.stringify(c._desiredActionFor('climate.room',90)),JSON.stringify({hvacMode:null,temperature:21}));
+});
